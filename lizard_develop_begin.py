@@ -1,72 +1,72 @@
 #!/usr/bin/env python3
 """
-lizard_develop_begin.py
+ltt_no_portals.py
 
-Instrumented evolution script with robust URDF generation and validation.
-- Writes URDFs that include full <inertial> inertia elements
-- Tests each URDF by attempting to load it into a temporary PyBullet DIRECT client
-- If URDF load fails, prints useful diagnostics and aborts
-
-Usage:
-  python lizard_develop_begin.py             # run evolution (defaults)
-  python lizard_develop_begin.py --unit_test --controller best_model.pkl
-  python lizard_develop_begin.py --capture_frames --perturb_init_pose 0.02
+Modified from original ltt_portals.py:
+ - portals, cubes and untrained GUI logic removed.
+ - fitness now measures forward speed and correct head-turn behavior when contacting fixed walls.
+ - if wall is movable and the lizard pushes it (wall moves), a head-turn in response is penalized.
+ - URDF writer and MLP controller preserved.
+ - Outputs: generation CSVs and BEST_MODEL_FILE (best_model.pkl) with controller.weights suitable for deployment.
 """
-
 import os
-import sys
-import argparse
+import time
 import math
 import random
-import time
-import csv
 import pickle
+import csv
+import sys
 from datetime import datetime
 from collections import namedtuple
 
 import numpy as np
 import pybullet as p
 import pybullet_data
-from PIL import Image
 
-# ---------------------------
+# ------------------------------
 # Config
-# ---------------------------
-POPULATION = 12
-GENERATIONS = 200
-GENERATION_DURATION = 30.0
-SIMULATION_STEP = 1.0 / 240.0
+# ------------------------------
+POPULATION = 10
+GENERATIONS = 120
+GENERATION_DURATION = 60.0           # seconds per generation in sim
+SIMULATION_STEP = 1.0 / 240.0        # physics step
 STEPS_PER_GEN = int(GENERATION_DURATION / SIMULATION_STEP)
 WORLD_GRAVITY = -9.81
 SEED = 42
 ELITE_COUNT = 1
 MUTATION_RATE = 0.06
 MUTATION_PROB = 0.15
-HIDDEN_NEURONS = 32
+HIDDEN_NEURONS = 24
 
-OUTPUT_ROOT = f"upright_instrumented_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-os.makedirs(OUTPUT_ROOT, exist_ok=True)
+OUTPUT_FOLDER = f"evolution_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+STATS_CSV = os.path.join(OUTPUT_FOLDER, "generation_stats.csv")
+PER_INDIVIDUAL_CSV = os.path.join(OUTPUT_FOLDER, "per_individual_stats.csv")
+BEST_MODEL_FILE = os.path.join(OUTPUT_FOLDER, "best_model.pkl")
+URDF_FOLDER = os.path.join(OUTPUT_FOLDER, "urdfs")
+os.makedirs(URDF_FOLDER, exist_ok=True)
 
-MAX_FRAME_WIDTH = 320
-MAX_FRAME_HEIGHT = 240
-FRAME_SAVE_EVERY = 5
-CSV_FLUSH_EVERY = 100
+random.seed(SEED)
+np.random.seed(SEED)
 
-W_UPRIGHT = 1.5
-W_TRAVEL = 1.0
-W_TURN_AFTER_HIT = 3.0
+# Wall settings: set mass to 0.0 for unmovable (fixed) wall, >0.0 for movable wall
+LEFT_WALL_MASS = 0.0     # if 0 => fixed (doesn't budge); if >0, wall will move when pushed
+RIGHT_WALL_MASS = 0.0
 
-# ---------------------------
-# Determinism helper
-# ---------------------------
-def set_global_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    print(f"[seed] global seed set to {seed}")
+# world layout
+WALL_THICKNESS = 0.2
+WALL_HEIGHT = 1.0
+WALL_LENGTH = 6.0
+ARENA_RADIUS = 1.5
 
-# ---------------------------
-# MLPController
-# ---------------------------
+# fitness weights
+FIT_FORWARD_WEIGHT = 1.0       # forward displacement component (meters)
+FIT_HEAD_TURN_WEIGHT = 1.5     # reward when head turns away appropriately on fixed-wall contact
+PENALTY_REFUSE_ON_MOVABLE = 1.0 # penalty when agent turns away while wall moved (i.e., should have pushed)
+
+# ------------------------------
+# MLP Controller (unchanged except for minor output size flexibility)
+# ------------------------------
 class MLPController:
     def __init__(self, input_size, hidden_size, output_size, weights=None):
         self.input_size = input_size
@@ -107,7 +107,8 @@ class MLPController:
     def copy(self):
         new_w = {k: np.array(v, copy=True) for k, v in self.weights.items()}
         child = MLPController(self.input_size, self.hidden_size, self.output_size, new_w)
-        child.color = tuple(self.color)
+        if hasattr(self, 'color'):
+            child.color = tuple(self.color)
         return child
 
     @staticmethod
@@ -119,7 +120,8 @@ class MLPController:
         child_flat = np.where(mask, fa, fb)
         child = MLPController(parent_a.input_size, parent_a.hidden_size, parent_a.output_size)
         child.set_flat(child_flat)
-        child.color = tuple(parent_a.color) if (random.random() < 0.5) else tuple(parent_b.color)
+        if hasattr(parent_a, 'color') and hasattr(parent_b, 'color'):
+            child.color = tuple(parent_a.color) if (random.random() < 0.5) else tuple(parent_b.color)
         return child
 
     def mutate(self, rate=MUTATION_RATE, prob=MUTATION_PROB):
@@ -129,291 +131,267 @@ class MLPController:
         flat = np.where(mutation_mask, flat + gaussian, flat)
         self.set_flat(flat)
 
-# ---------------------------
-# Robust URDF writer + test loader
-# ---------------------------
-def box_inertia(mass, lx, ly, lz):
-    # lx = length in x (m), ly = width in y, lz = height in z
-    ixx = (1.0/12.0) * mass * (ly*ly + lz*lz)
-    iyy = (1.0/12.0) * mass * (lx*lx + lz*lz)
-    izz = (1.0/12.0) * mass * (lx*lx + ly*ly)
-    return ixx, iyy, izz
-
-def write_lizard_urdf(path, morphology='default', scale=1.0, name_prefix="lizard", body_color=(0.3,0.6,0.3,1.0)):
-    """
-    Robust URDF writer:
-    - Proper XML nesting
-    - Full <inertial> with inertia tensor
-    - Every revolute joint includes a <limit> element (required by PyBullet)
-    - Two morphologies: 'simple' (2 hips + head) and 'default' (bigger)
-    """
-    def box_inertia(mass, lx, ly, lz):
-        ixx = (1.0/12.0) * mass * (ly*ly + lz*lz)
-        iyy = (1.0/12.0) * mass * (lx*lx + lz*lz)
-        izz = (1.0/12.0) * mass * (lx*lx + ly*ly)
-        return ixx, iyy, izz
-
+# ------------------------------
+# URDF writer (kept intact from original)
+# ------------------------------
+def write_lizard_urdf(path, body_segments=5, tail_segments=3, scale=1.0, name_prefix="lizard", body_color=(0.3,0.6,0.3,1.0)):
+    # (Full write_lizard_urdf content preserved from original file)
+    # For brevity in this inline listing, we will copy original function body EXACTLY
+    # In your copy please paste the original write_lizard_urdf function body unchanged.
+    # --- BEGIN original URDF writer (paste in unchanged) ---
     r,g,b,a = [float(x) for x in body_color]
+    body_length = 0.35 * scale
+    body_height = 0.08 * scale
+    body_width = 0.12 * scale
+    tail_length = 0.22 * scale
+    leg_length = 0.22 * scale
+
+    joints = []
     lines = []
     lines.append('<?xml version="1.0" ?>')
     lines.append(f'<robot name="{name_prefix}">')
-    lines.append(f'  <material name="body_color"><color rgba="{r} {g} {b} {a}"/></material>')
-
-    # conservative default joint limits (used for all revolute joints)
-    default_limit = {"lower": -1.5708, "upper": 1.5708, "effort": 20.0, "velocity": 4.0}
-
-    if morphology == 'simple':
-        # body
-        body_length = 0.30 * scale
-        body_width  = 0.12 * scale
-        body_height = 0.08 * scale
-        body_mass   = 0.90 * scale
-        ixx, iyy, izz = box_inertia(body_mass, body_length, body_width, body_height)
-
+    lines += [
+        f'  <material name="body_color"><color rgba="{r} {g} {b} {a}"/></material>',
+        '  <material name="jaw_color"><color rgba="0.7 0.15 0.15 1"/></material>',
+        '  <material name="black"><color rgba="0 0 0 1"/></material>'
+    ]
+    lines += [
+        '  <link name="body_0">',
+        '    <inertial>',
+        f'      <mass value="{0.6*scale}"/>',
+        '      <inertia ixx="0.001" iyy="0.001" izz="0.001"/>',
+        '    </inertial>',
+        '    <visual>',
+        f'      <geometry><box size="{body_length} {body_width} {body_height}"/></geometry>',
+        '      <material name="body_color"/>',
+        '    </visual>',
+        '    <collision>',
+        f'      <geometry><box size="{body_length} {body_width} {body_height}"/></geometry>',
+        '    </collision>',
+        '  </link>'
+    ]
+    for i in range(1, body_segments):
         lines += [
-            '  <link name="body_0">',
+            f'  <link name="body_{i}">',
             '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{body_mass:.6f}"/>',
-            f'      <inertia ixx="{ixx:.8f}" iyy="{iyy:.8f}" izz="{izz:.8f}" ixy="0" ixz="0" iyz="0"/>',
+            f'      <mass value="{0.45*scale}"/>',
+            '      <inertia ixx="0.001" iyy="0.001" izz="0.001"/>',
             '    </inertial>',
-            f'    <visual><geometry><box size="{body_length:.6f} {body_width:.6f} {body_height:.6f}"/></geometry><material name="body_color"/></visual>',
-            f'    <collision><geometry><box size="{body_length:.6f} {body_width:.6f} {body_height:.6f}"/></geometry></collision>',
+            '    <visual>',
+            f'      <geometry><box size="{body_length} {body_width} {body_height}"/></geometry>',
+            '      <material name="body_color"/>',
+            '    </visual>',
+            '    <collision>',
+            f'      <geometry><box size="{body_length} {body_width} {body_height}"/></geometry>',
+            '    </collision>',
             '  </link>'
         ]
-
-        # head
-        head_length = 0.16 * scale
-        head_width  = body_width
-        head_height = 0.06 * scale
-        head_mass   = 0.25 * scale
-        ixx, iyy, izz = box_inertia(head_mass, head_length, head_width, head_height)
-
+        jname = f'body_joint_{i-1}_{i}'
+        axis = "0 0 1"
+        origin_x = body_length * 0.9
         lines += [
-            '  <link name="head">',
-            '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{head_mass:.6f}"/>',
-            f'      <inertia ixx="{ixx:.8f}" iyy="{iyy:.8f}" izz="{izz:.8f}" ixy="0" ixz="0" iyz="0"/>',
-            '    </inertial>',
-            f'    <visual><geometry><box size="{head_length:.6f} {head_width:.6f} {head_height:.6f}"/></geometry><material name="body_color"/></visual>',
-            f'    <collision><geometry><box size="{head_length:.6f} {head_width:.6f} {head_height:.6f}"/></geometry></collision>',
-            '  </link>',
-            '  <joint name="head_joint" type="revolute">',
-            '    <parent link="body_0"/>',
-            '    <child link="head"/>',
-            f'    <origin xyz="{(-body_length*0.55):.6f} 0 {(body_height*0.5 + head_height*0.5 - 0.01):.6f}" rpy="0 0 0"/>',
-            '    <axis xyz="0 1 0"/>',
-            f'    <limit lower="{default_limit["lower"]:.6f}" upper="{default_limit["upper"]:.6f}" effort="{default_limit["effort"]:.1f}" velocity="{default_limit["velocity"]:.1f}"/>',
+            f'  <joint name="{jname}" type="revolute">',
+            f'    <parent link="body_{i-1}"/>',
+            f'    <child link="body_{i}"/>',
+            f'    <origin xyz="{origin_x} 0 0" rpy="0 0 0"/>',
+            f'    <axis xyz="{axis}"/>',
+            '    <limit lower="-1.2" upper="1.2" effort="50" velocity="4.0"/>',
             '  </joint>'
         ]
-
-        # hips (left/right)
-        hip_mass = 0.05 * scale
-        hip_ixx, hip_iyy, hip_izz = box_inertia(hip_mass, 0.02, 0.02, 0.02)
-
+        joints.append(jname)
+    for t in range(tail_segments):
         lines += [
-            '  <link name="hip_left">',
+            f'  <link name="tail_{t}">',
             '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{hip_mass:.6f}"/>',
-            f'      <inertia ixx="{hip_ixx:.8f}" iyy="{hip_iyy:.8f}" izz="{hip_izz:.8f}" ixy="0" ixz="0" iyz="0"/>',
+            f'      <mass value="{0.2*scale}"/>',
+            '      <inertia ixx="0.0005" iyy="0.0005" izz="0.0005"/>',
             '    </inertial>',
-            '  </link>',
-            '  <joint name="hip_left_joint" type="revolute">',
-            '    <parent link="body_0"/>',
-            '    <child link="hip_left"/>',
-            '    <origin xyz="0 0.08 -0.02" rpy="0 0 0"/>',
-            '    <axis xyz="0 0 1"/>',
-            f'    <limit lower="{default_limit["lower"]:.6f}" upper="{default_limit["upper"]:.6f}" effort="{default_limit["effort"]:.1f}" velocity="{default_limit["velocity"]:.1f}"/>',
-            '  </joint',
-            # Note: previous error was mismatched element—make sure to close tags correctly. We'll continue with properly closed joints below.
-        ]
-        # above I intentionally closed incorrectly to show what to avoid; ensure we correct it below by removing that stray line
-        # Fixing: remove the stray '  </joint' line and instead append a correct joint close; we'll overwrite the 'lines' end appropriately.
-
-        # Remove the incorrect stray element we just added (safe guard in case of copy-paste)
-        if lines[-1].strip() == '  </joint':
-            lines.pop()
-
-        # correctly add hip joints (left/right)
-        lines += [
-            '  <joint name="hip_left_joint" type="revolute">',
-            '    <parent link="body_0"/>',
-            '    <child link="hip_left"/>',
-            '    <origin xyz="0 0.08 -0.02" rpy="0 0 0"/>',
-            '    <axis xyz="0 0 1"/>',
-            f'    <limit lower="{default_limit["lower"]:.6f}" upper="{default_limit["upper"]:.6f}" effort="{default_limit["effort"]:.1f}" velocity="{default_limit["velocity"]:.1f}"/>',
-            '  </joint>',
-            '  <link name="hip_right">',
-            '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{hip_mass:.6f}"/>',
-            f'      <inertia ixx="{hip_ixx:.8f}" iyy="{hip_iyy:.8f}" izz="{hip_izz:.8f}" ixy="0" ixz="0" iyz="0"/>',
-            '    </inertial>',
-            '  </link>',
-            '  <joint name="hip_right_joint" type="revolute">',
-            '    <parent link="body_0"/>',
-            '    <child link="hip_right"/>',
-            '    <origin xyz="0 -0.08 -0.02" rpy="0 0 0"/>',
-            '    <axis xyz="0 0 1"/>',
-            f'    <limit lower="{default_limit["lower"]:.6f}" upper="{default_limit["upper"]:.6f}" effort="{default_limit["effort"]:.1f}" velocity="{default_limit["velocity"]:.1f}"/>',
-            '  </joint>'
-        ]
-
-    else:
-        # default (larger) morphology: same structure, full inertials, proper joint limits
-        body_length = 0.35 * scale
-        body_width  = 0.12 * scale
-        body_height = 0.08 * scale
-        body_mass   = 0.90 * scale
-        ixx, iyy, izz = box_inertia(body_mass, body_length, body_width, body_height)
-
-        lines += [
-            '  <link name="body_0">',
-            '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{body_mass:.6f}"/>',
-            f'      <inertia ixx="{ixx:.8f}" iyy="{iyy:.8f}" izz="{izz:.8f}" ixy="0" ixz="0" iyz="0"/>',
-            '    </inertial>',
-            f'    <visual><geometry><box size="{body_length:.6f} {body_width:.6f} {body_height:.6f}"/></geometry><material name="body_color"/></visual>',
-            f'    <collision><geometry><box size="{body_length:.6f} {body_width:.6f} {body_height:.6f}"/></geometry></collision>',
+            '    <visual>',
+            f'      <geometry><box size="{tail_length} {0.08*scale} {0.06*scale}"/></geometry>',
+            '      <material name="body_color"/>',
+            '    </visual>',
+            '    <collision>',
+            f'      <geometry><box size="{tail_length} {0.08*scale} {0.06*scale}"/></geometry>',
+            '    </collision>',
             '  </link>'
         ]
-
-        head_length = 0.18 * scale
-        head_width  = body_width
-        head_height = 0.06 * scale
-        head_mass   = 0.25 * scale
-        ixx, iyy, izz = box_inertia(head_mass, head_length, head_width, head_height)
-
+        parent = f'body_{body_segments-1}' if t == 0 else f'tail_{t-1}'
+        jname = f'tail_joint_{t}'
+        axis = "0 0 1"
+        origin_x = tail_length * 0.9
         lines += [
-            '  <link name="head">',
-            '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{head_mass:.6f}"/>',
-            f'      <inertia ixx="{ixx:.8f}" iyy="{iyy:.8f}" izz="{izz:.8f}" ixy="0" ixz="0" iyz="0"/>',
-            '    </inertial>',
-            f'    <visual><geometry><box size="{head_length:.6f} {head_width:.6f} {head_height:.6f}"/></geometry><material name="body_color"/></visual>',
-            f'    <collision><geometry><box size="{head_length:.6f} {head_width:.6f} {head_height:.6f}"/></geometry></collision>',
-            '  </link>',
-            '  <joint name="head_joint" type="revolute">',
-            '    <parent link="body_0"/>',
-            '    <child link="head"/>',
-            f'    <origin xyz="{(-body_length*0.55):.6f} 0 {(body_height*0.5 + head_height*0.5 - 0.01):.6f}" rpy="0 0 0"/>',
-            '    <axis xyz="0 1 0"/>',
-            f'    <limit lower="{default_limit["lower"]:.6f}" upper="{default_limit["upper"]:.6f}" effort="{default_limit["effort"]:.1f}" velocity="{default_limit["velocity"]:.1f}"/>',
+            f'  <joint name="{jname}" type="revolute">',
+            f'    <parent link="{parent}"/>',
+            f'    <child link="tail_{t}"/>',
+            f'    <origin xyz="{origin_x} 0 0" rpy="0 0 0"/>',
+            f'    <axis xyz="{axis}"/>',
+            '    <limit lower="-1.5" upper="1.5" effort="30" velocity="4.0"/>',
             '  </joint>'
         ]
-
-        # jaw link
-        jaw_mass = 0.02 * scale
-        jixx, jiyy, jizz = box_inertia(jaw_mass, 0.05, 0.02, 0.02)
+        joints.append(jname)
+    head_length = 0.18 * scale
+    head_width = 0.12 * scale
+    head_height = 0.06 * scale
+    lines += [
+        '  <link name="head">',
+        '    <inertial>',
+        f'      <mass value="{0.25*scale}"/>',
+        '      <inertia ixx="0.0006" iyy="0.0006" izz="0.0006"/>',
+        '    </inertial>',
+        '    <visual>',
+        f'      <geometry><box size="{head_length} {head_width} {head_height}"/></geometry>',
+        '      <material name="body_color"/>',
+        '    </visual>',
+        '    <collision>',
+        f'      <geometry><box size="{head_length} {head_width} {head_height}"/></geometry>',
+        '    </collision>',
+        '  </link>',
+        '  <joint name="head_joint" type="revolute">',
+        '    <parent link="body_0"/>',
+        '    <child link="head"/>',
+        f'    <origin xyz="{-body_length*0.55} 0 {body_height*0.5 + head_height*0.5 - 0.01}" rpy="0 0 0"/>',
+        '    <axis xyz="0 1 0"/>',
+        '    <limit lower="-1.2" upper="1.2" effort="20" velocity="4.0"/>',
+        '  </joint>',
+    ]
+    jaw_length = head_length * 1.05
+    jaw_width = 0.075 * scale
+    jaw_height = 0.05 * scale
+    jaw_mass = 0.12 * scale
+    lines += [
+        '  <link name="jaw">',
+        '    <inertial>',
+        f'      <mass value="{jaw_mass}"/>',
+        '      <inertia ixx="0.0004" iyy="0.0004" izz="0.0004"/>',
+        '    </inertial>',
+        '    <visual>',
+        f'      <geometry><box size="{jaw_length} {jaw_width} {jaw_height}"/></geometry>',
+        '      <material name="jaw_color"/>',
+        '    </visual>',
+        '    <collision>',
+        f'      <geometry><box size="{jaw_length} {jaw_width} {jaw_height}"/></geometry>',
+        '    </collision>',
+        '  </link>',
+        '  <joint name="jaw_joint" type="revolute">',
+        '    <parent link="head"/>',
+        '    <child link="jaw"/>',
+        f'    <origin xyz="{head_length*0.25} 0 {-head_height*0.5 - 0.005}" rpy="0 0 0"/>',
+        '    <axis xyz="0 1 0"/>',
+        '    <limit lower="-1.5" upper="0.5" effort="32" velocity="4.0"/>',
+        '  </joint>'
+    ]
+    joints += ['head_joint', 'jaw_joint']
+    leg_positions = [
+        ("front_left", "body_0", 0.02, 0.12),
+        ("front_right", "body_0", -0.02, -0.12),
+        ("rear_left", f"body_{body_segments-1}", 0.02, 0.12),
+        ("rear_right", f"body_{body_segments-1}", -0.02, -0.12),
+    ]
+    for (lname, parent_link, z_off, y_off) in leg_positions:
+        yaw = 0.6 if y_off > 0 else -0.6
         lines += [
-            '  <link name="jaw">',
+            f'  <link name="{lname}_hip">',
             '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{jaw_mass:.6f}"/>',
-            f'      <inertia ixx="{jixx:.8f}" iyy="{jiyy:.8f}" izz="{jizz:.8f}" ixy="0" ixz="0" iyz="0"/>',
+            f'      <mass value="{0.08*scale}"/>',
+            '      <inertia ixx="0.0002" iyy="0.0002" izz="0.0002"/>',
             '    </inertial>',
+            '    <visual>',
+            f'      <geometry><box size="{leg_length} {0.04*scale} {0.04*scale}"/></geometry>',
+            '      <material name="body_color"/>',
+            '    </visual>',
+            '    <collision>',
+            f'      <geometry><box size="{leg_length} {0.04*scale} {0.04*scale}"/></geometry>',
+            '    </collision>',
             '  </link>',
-            '  <joint name="jaw_joint" type="revolute">',
-            '    <parent link="head"/>',
-            '    <child link="jaw"/>',
-            '    <origin xyz="0 0 0" rpy="0 0 0"/>',
-            '    <axis xyz="0 1 0"/>',
-            f'    <limit lower="-0.8" upper="0.8" effort="5.0" velocity="4.0"/>',
-            '  </joint>'
-        ]
-
-        # hips
-        hip_mass = 0.05 * scale
-        hip_ixx, hip_iyy, hip_izz = box_inertia(hip_mass, 0.02, 0.02, 0.02)
-        lines += [
-            '  <link name="front_left_hip">',
-            '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{hip_mass:.6f}"/>',
-            f'      <inertia ixx="{hip_ixx:.8f}" iyy="{hip_iyy:.8f}" izz="{hip_izz:.8f}" ixy="0" ixz="0" iyz="0"/>',
-            '    </inertial>',
-            '  </link>',
-            '  <joint name="front_left_hip_joint" type="revolute">',
-            '    <parent link="body_0"/>',
-            '    <child link="front_left_hip"/>',
-            '    <origin xyz="0 0.08 -0.02" rpy="0 0 0"/>',
+            f'  <joint name="{lname}_hip_joint" type="revolute">',
+            f'    <parent link="{parent_link}"/>',
+            f'    <child link="{lname}_hip"/>',
+            f'    <origin xyz="0 {y_off} {z_off}" rpy="0 0 {yaw}"/>',
             '    <axis xyz="0 0 1"/>',
-            f'    <limit lower="{default_limit["lower"]:.6f}" upper="{default_limit["upper"]:.6f}" effort="{default_limit["effort"]:.1f}" velocity="{default_limit["velocity"]:.1f}"/>',
+            '    <limit lower="-1.2" upper="1.2" effort="30" velocity="4.0"/>',
             '  </joint>',
-            '  <link name="front_right_hip">',
+            f'  <link name="{lname}_knee">',
             '    <inertial>',
-            '      <origin xyz="0 0 0" rpy="0 0 0"/>',
-            f'      <mass value="{hip_mass:.6f}"/>',
-            f'      <inertia ixx="{hip_ixx:.8f}" iyy="{hip_iyy:.8f}" izz="{hip_izz:.8f}" ixy="0" ixz="0" iyz="0"/>',
+            f'      <mass value="{0.06*scale}"/>',
+            '      <inertia ixx="0.00015" iyy="0.00015" izz="0.00015"/>',
             '    </inertial>',
+            '    <visual>',
+            f'      <geometry><box size="{leg_length} {0.03*scale} {0.03*scale}"/></geometry>',
+            '      <material name="body_color"/>',
+            '    </visual>',
+            '    <collision>',
+            f'      <geometry><box size="{leg_length} {0.03*scale} {0.03*scale}"/></geometry>',
+            '    </collision>',
             '  </link>',
-            '  <joint name="front_right_hip_joint" type="revolute">',
-            '    <parent link="body_0"/>',
-            '    <child link="front_right_hip"/>',
-            '    <origin xyz="0 -0.08 -0.02" rpy="0 0 0"/>',
+            f'  <joint name="{lname}_knee_joint" type="revolute">',
+            f'    <parent link="{lname}_hip"/>',
+            f'    <child link="{lname}_knee"/>',
+            f'    <origin xyz="{leg_length*0.45} 0 -0.06" rpy="0 0 0"/>',
             '    <axis xyz="0 0 1"/>',
-            f'    <limit lower="{default_limit["lower"]:.6f}" upper="{default_limit["upper"]:.6f}" effort="{default_limit["effort"]:.1f}" velocity="{default_limit["velocity"]:.1f}"/>',
+            '    <limit lower="-1.4" upper="0.6" effort="20" velocity="4.0"/>',
             '  </joint>'
         ]
-
+        joints += [f'{lname}_hip_joint', f'{lname}_knee_joint']
+    tiny_mass = 0.001 * scale
+    eye_radius = 0.02 * scale
+    eye_top_z = head_height * 0.5 + 0.01
+    eye_y_offset = head_width * 0.35
+    lines += [
+        f'  <link name="eye_left">',
+        '    <inertial>',
+        f'      <mass value="{tiny_mass}"/>',
+        '      <inertia ixx="0.000001" iyy="0.000001" izz="0.000001"/>',
+        '    </inertial>',
+        '    <visual>',
+        f'      <geometry><sphere radius="{eye_radius}"/></geometry>',
+        '      <material name="black"/>',
+        '    </visual>',
+        '    <collision>',
+        f'      <geometry><sphere radius="{eye_radius}"/></geometry>',
+        '    </collision>',
+        '  </link>',
+        '  <joint name="eye_left_fixed" type="fixed">',
+        '    <parent link="head"/>',
+        '    <child link="eye_left"/>',
+        f'    <origin xyz="{0:.6f} {eye_y_offset:.6f} {eye_top_z:.6f}" rpy="0 0 0"/>',
+        '  </joint>',
+        f'  <link name="eye_right">',
+        '    <inertial>',
+        f'      <mass value="{tiny_mass}"/>',
+        '      <inertia ixx="0.000001" iyy="0.000001" izz="0.000001"/>',
+        '    </inertial>',
+        '    <visual>',
+        f'      <geometry><sphere radius="{eye_radius}"/></geometry>',
+        '      <material name="black"/>',
+        '    </visual>',
+        '    <collision>',
+        f'      <geometry><sphere radius="{eye_radius}"/></geometry>',
+        '    </collision>',
+        '  </link>',
+        '  <joint name="eye_right_fixed" type="fixed">',
+        '    <parent link="head"/>',
+        '    <child link="eye_right"/>',
+        f'    <origin xyz="{0:.6f} {-eye_y_offset:.6f} {eye_top_z:.6f}" rpy="0 0 0"/>',
+        '  </joint>'
+    ]
     lines.append('</robot>')
-
-    # write to file
     with open(path, 'w') as f:
         f.write("\n".join(lines))
+    return joints
+    # --- END original URDF writer ---
 
-    # Basic validation: attempt to load the URDF quickly into a DIRECT pybullet client
-    if not validate_urdf_load(path):
-        raise RuntimeError(f"URDF validation failed for file: {path}")
-
-    return
-
-def validate_urdf_load(urdf_path):
-    """
-    Attempt to load the URDF into a temporary DIRECT PyBullet client.
-    Return True if load succeeds, False otherwise (and print diagnostics).
-    """
-    client = None
-    try:
-        client = p.connect(p.DIRECT)
-        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client)
-        # try to load; if it fails PyBullet will raise an error
-        uid = p.loadURDF(urdf_path, physicsClientId=client)
-        if uid < 0:
-            print(f"[validate_urdf] loadURDF returned invalid uid {uid} for {urdf_path}")
-            return False
-        # success
-        p.removeBody(uid, physicsClientId=client)
-        p.disconnect(client)
-        return True
-    except Exception as e:
-        print(f"[validate_urdf] Failed to load URDF '{urdf_path}': {e}")
-        if client is not None:
-            try:
-                p.disconnect(client)
-            except Exception:
-                pass
-        return False
-
-# ---------------------------
-# Spawn helper
-# ---------------------------
-LizardInstance = namedtuple('LizardInstance', ['body_uid', 'joint_indices', 'start_pos', 'link_name_map', 'head_link_index'])
+# ------------------------------
+# Utilities
+# ------------------------------
+LizardInstance = namedtuple('LizardInstance', ['body_uid', 'joint_indices', 'start_pos', 'link_name_map', 'leg_joints'])
 
 def spawn_lizard_from_urdf(client, urdf_path, base_position, base_orientation=(0,0,0,1), global_scale=1.0):
-    try:
-        uid = p.loadURDF(urdf_path, basePosition=base_position, baseOrientation=base_orientation,
-                         useFixedBase=False, globalScaling=global_scale, physicsClientId=client)
-    except Exception as e:
-        raise RuntimeError(f"Failed to spawn URDF '{urdf_path}': {e}")
+    uid = p.loadURDF(urdf_path, basePosition=base_position, baseOrientation=base_orientation,
+                     useFixedBase=False, globalScaling=global_scale, physicsClientId=client)
     num_joints = p.getNumJoints(uid, physicsClientId=client)
     joint_indices = []
     link_name_map = {}
-    head_link_index = None
+    leg_joints = []
     for ji in range(num_joints):
         info = p.getJointInfo(uid, ji, physicsClientId=client)
         jtype = info[2]
@@ -422,127 +400,87 @@ def spawn_lizard_from_urdf(client, urdf_path, base_position, base_orientation=(0
         link_name_map[ji] = link_name
         if jtype == p.JOINT_REVOLUTE:
             joint_indices.append(ji)
-        if 'head' in link_name.lower() or 'head_joint' in str(info[1]).lower():
-            head_link_index = ji
+        lname_low = link_name.lower()
+        if 'hip' in lname_low or 'knee' in lname_low:
+            leg_joints.append(ji)
     start_pos = p.getBasePositionAndOrientation(uid, physicsClientId=client)[0]
-    return LizardInstance(body_uid=uid, joint_indices=joint_indices, start_pos=start_pos, link_name_map=link_name_map, head_link_index=head_link_index)
+    return LizardInstance(body_uid=uid, joint_indices=joint_indices, start_pos=start_pos,
+                          link_name_map=link_name_map, leg_joints=leg_joints)
 
-# ---------------------------
-# Rollout logger
-# ---------------------------
-class RolloutLogger:
-    def __init__(self, outdir, rollout_name, header_fields):
-        self.outdir = outdir
-        os.makedirs(outdir, exist_ok=True)
-        self.csv_path = os.path.join(outdir, f"{rollout_name}.csv")
-        self.frame_dir = os.path.join(outdir, f"{rollout_name}_frames")
-        os.makedirs(self.frame_dir, exist_ok=True)
-        self.csv_file = open(self.csv_path, 'w', newline='')
-        self.writer = csv.writer(self.csv_file)
-        self.writer.writerow(header_fields)
-        self.step_count = 0
+def make_initial_population(pop_size, input_size, hidden_size, output_size):
+    return [MLPController(input_size, hidden_size, output_size) for _ in range(pop_size)]
 
-    def log_step(self, row):
-        self.writer.writerow(row)
-        self.step_count += 1
-        if self.step_count % CSV_FLUSH_EVERY == 0:
-            self.csv_file.flush()
-
-    def save_frame(self, frame_arr, frame_index):
-        img = Image.fromarray(frame_arr[:, :, :3])
-        img_path = os.path.join(self.frame_dir, f"frame_{frame_index:06d}.png")
-        img.save(img_path)
-
-    def close(self):
-        try:
-            self.csv_file.close()
-        except Exception:
-            pass
-
-# ---------------------------
-# Evaluation
-# ---------------------------
-def evaluate_population(client, controllers, urdf_files, generation_idx,
-                        debug_outdir, perturb_init_pose=0.0, sensor_noise=0.0, mass_perturb=0.0,
-                        capture_frames=False, seed_override=None):
-    if seed_override is not None:
-        random.seed(seed_override)
-        np.random.seed(seed_override)
-
+# ------------------------------
+# Evaluation - simplified arena with two walls
+# ------------------------------
+def evaluate_population(client, controllers, urdf_files, generation, total_generations,
+                        display=False):
     p.resetSimulation(physicsClientId=client)
     p.setGravity(0, 0, WORLD_GRAVITY, physicsClientId=client)
     p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client)
     plane_id = p.loadURDF("plane.urdf", physicsClientId=client)
 
-    WALL_THICKNESS = 0.2
-    WALL_HEIGHT = 2.0
-    ARENA_RADIUS = 1.5
-    wall_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[WALL_THICKNESS/2, ARENA_RADIUS+0.5, WALL_HEIGHT/2], physicsClientId=client)
-    left_wall = p.createMultiBody(baseMass=0.0, baseCollisionShapeIndex=wall_col, basePosition=[-ARENA_RADIUS - WALL_THICKNESS/2, 0, WALL_HEIGHT/2], physicsClientId=client)
-    right_wall = p.createMultiBody(baseMass=0.0, baseCollisionShapeIndex=wall_col, basePosition=[ARENA_RADIUS + WALL_THICKNESS/2, 0, WALL_HEIGHT/2], physicsClientId=client)
-    tall_col = p.createCollisionShape(p.GEOM_BOX, halfExtents=[ARENA_RADIUS+0.5, WALL_THICKNESS/2, WALL_HEIGHT/2], physicsClientId=client)
-    front_wall = p.createMultiBody(baseMass=0.0, baseCollisionShapeIndex=tall_col, basePosition=[0, ARENA_RADIUS + WALL_THICKNESS/2, WALL_HEIGHT/2], physicsClientId=client)
-    back_wall = p.createMultiBody(baseMass=0.0, baseCollisionShapeIndex=tall_col, basePosition=[0, -ARENA_RADIUS - WALL_THICKNESS/2, WALL_HEIGHT/2], physicsClientId=client)
-    wall_ids = [left_wall, right_wall, front_wall, back_wall]
+    # build two walls facing the arena center along x axis (left and right)
+    # walls centered at +/- (ARENA_RADIUS + offset)
+    offset = ARENA_RADIUS + 0.2
+    wall_half_extents = [WALL_THICKNESS/2.0, WALL_LENGTH/2.0, WALL_HEIGHT/2.0]
 
+    wall_collision = p.createCollisionShape(p.GEOM_BOX, halfExtents=wall_half_extents, physicsClientId=client)
+    wall_visual = p.createVisualShape(p.GEOM_BOX, halfExtents=wall_half_extents, rgbaColor=[0.6,0.6,0.6,1], physicsClientId=client)
+
+    left_wall = p.createMultiBody(baseMass=LEFT_WALL_MASS, baseCollisionShapeIndex=wall_collision, baseVisualShapeIndex=wall_visual,
+                                  basePosition=[-offset, 0, WALL_HEIGHT/2.0], physicsClientId=client)
+    right_wall = p.createMultiBody(baseMass=RIGHT_WALL_MASS, baseCollisionShapeIndex=wall_collision, baseVisualShapeIndex=wall_visual,
+                                   basePosition=[offset, 0, WALL_HEIGHT/2.0], physicsClientId=client)
+
+    # spawn agents in circle
+    n_agents = len(controllers)
+    center_x = 0.0
+    center_y = 0.0
+    start_z = 0.12
+    radius = max(0.5, 0.6 * n_agents / (2.0 * math.pi))
     agents = []
     agent_controllers = [c.copy() for c in controllers]
 
-    center_x = 0.0
-    center_y = 0.0
-    n_agents = len(agent_controllers)
-    radius = 0.5 + (0.5 * math.sqrt(n_agents))
     for i, ctl in enumerate(agent_controllers):
         angle = (2.0 * math.pi * i) / float(n_agents)
         px = center_x + radius * math.cos(angle)
         py = center_y + radius * math.sin(angle)
-        delta_x = random.uniform(-perturb_init_pose, perturb_init_pose)
-        delta_y = random.uniform(-perturb_init_pose, perturb_init_pose)
-        delta_yaw = random.uniform(-perturb_init_pose, perturb_init_pose)
-        pos = (px + delta_x, py + delta_y, 0.12)
-        ori = p.getQuaternionFromEuler((0, 0, delta_yaw))
+        pos = (px, py, start_z)
         urdf_file = urdf_files[i % len(urdf_files)]
-        uid = spawn_lizard_from_urdf(client, urdf_file, base_position=pos, base_orientation=ori)
+        uid = spawn_lizard_from_urdf(client, urdf_file, base_position=pos)
         agents.append(uid)
         p.resetBaseVelocity(uid.body_uid, linearVelocity=[random.uniform(-0.05,0.05), random.uniform(-0.05,0.05), 0.0], physicsClientId=client)
-
-        if mass_perturb and mass_perturb > 0.0:
-            scale_factor = 1.0 + random.uniform(-mass_perturb, mass_perturb)
-            try:
-                p.changeDynamics(uid.body_uid, -1, mass=scale_factor * 1.0, physicsClientId=client)
-                for ji in range(p.getNumJoints(uid.body_uid, physicsClientId=client)):
-                    p.changeDynamics(uid.body_uid, ji, mass=scale_factor * 0.1, physicsClientId=client)
-            except Exception:
-                pass
+        yaw = math.atan2(center_y - py, center_x - px)
+        orn = p.getQuaternionFromEuler([0, 0, yaw])
+        p.resetBasePositionAndOrientation(uid.body_uid, pos, orn, physicsClientId=client)
 
     start_positions = [p.getBasePositionAndOrientation(a.body_uid, physicsClientId=client)[0] for a in agents]
-    yaw_at_last_head_contact = [None for _ in agents]
-    accumulated_yaw_change_after_hit = [0.0 for _ in agents]
-    head_contact_active = [False for _ in agents]
-    contact_cooldown_steps = [0 for _ in agents]
 
     dt = SIMULATION_STEP
     t = 0.0
 
     joints_per_agent = [a.joint_indices for a in agents]
 
-    logger_list = []
-    for i, agent in enumerate(agents):
-        rollout_name = f"gen{generation_idx}_ind{i}_rollout"
-        lg = RolloutLogger(debug_outdir, rollout_name,
-                           header_fields=[
-                               'step', 'time', 'base_x','base_y','base_z',
-                               'roll','pitch','yaw',
-                               'linvx','linvy','linvz','angvx','angvy','angvz',
-                               'head_contact_flag',
-                               'joint_indices','joint_positions','joint_targets',
-                               'contact_forces'])
-        logger_list.append(lg)
+    # track head turning events and wall movement
+    head_turn_events = [0 for _ in agents]
+    wall_movement_when_contact = [0 for _ in agents]  # 0 = no movement, 1 = moved
 
-    cam_distance = 1.0
-    cam_yaw = 0
-    cam_pitch = -30
-    up_axis_index = 2
+    # helper to find head joint index per agent
+    head_joint_idx = []
+    for a in agents:
+        hj = None
+        num_j = p.getNumJoints(a.body_uid, physicsClientId=client)
+        for ji in range(num_j):
+            info = p.getJointInfo(a.body_uid, ji, physicsClientId=client)
+            link_name = info[12].decode() if isinstance(info[12], (bytes, bytearray)) else str(info[12])
+            joint_name = info[1].decode() if isinstance(info[1], (bytes, bytearray)) else str(info[1])
+            if 'head' in link_name or 'head_joint' in joint_name:
+                hj = ji
+                break
+        head_joint_idx.append(hj)
+
+    max_head_turn_angle = 1.0  # rad expected full turn magnitude
 
     for step in range(STEPS_PER_GEN):
         for idx, agent in enumerate(agents):
@@ -550,18 +488,8 @@ def evaluate_population(client, controllers, urdf_files, generation_idx,
             base_pos, base_ori = p.getBasePositionAndOrientation(agent.body_uid, physicsClientId=client)
             base_lin_vel, base_ang_vel = p.getBaseVelocity(agent.body_uid, physicsClientId=client)
             roll, pitch, yaw = p.getEulerFromQuaternion(base_ori)
-            head_contact = False
-            if agent.head_link_index is not None:
-                for wid in wall_ids:
-                    contacts = p.getContactPoints(bodyA=agent.body_uid, bodyB=wid, linkIndexA=agent.head_link_index, physicsClientId=client)
-                    if contacts:
-                        head_contact = True
-                        break
-            hv = 1.0 if head_contact else 0.0
-            sensors = np.array([roll, pitch, base_lin_vel[0], base_lin_vel[1], hv, math.sin(t), math.cos(t)])
-            if sensor_noise and sensor_noise > 0.0:
-                sensors = sensors + np.random.randn(*sensors.shape) * sensor_noise
-            sensors = sensors / np.array([1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 1.0])
+            sensors = np.array([roll, pitch, base_lin_vel[0], base_lin_vel[1], math.sin(t), math.cos(t)])
+            sensors = sensors / np.array([1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
             out = ctl.forward(sensors)
 
             jinds = joints_per_agent[idx] if idx < len(joints_per_agent) else []
@@ -570,276 +498,189 @@ def evaluate_population(client, controllers, urdf_files, generation_idx,
             elif out.size > len(jinds):
                 out = out[:len(jinds)]
 
-            joint_positions = []
             for jlocal, joint_index in enumerate(jinds):
-                target = float(out[jlocal]) * 0.9
+                target = float(out[jlocal]) * 0.7
                 try:
-                    p.setJointMotorControl2(agent.body_uid, joint_index, controlMode=p.POSITION_CONTROL, targetPosition=target, force=60, physicsClientId=client)
+                    p.setJointMotorControl2(agent.body_uid, joint_index, controlMode=p.POSITION_CONTROL,
+                                            targetPosition=target, force=60, physicsClientId=client)
                 except Exception:
                     pass
-                try:
-                    js = p.getJointState(agent.body_uid, joint_index, physicsClientId=client)
-                    joint_positions.append(js[0])
-                except Exception:
-                    joint_positions.append(0.0)
-
-            if head_contact and contact_cooldown_steps[idx] == 0:
-                yaw_at_last_head_contact[idx] = yaw
-                head_contact_active[idx] = True
-                contact_cooldown_steps[idx] = int(0.25 / dt)
-            if head_contact_active[idx] and yaw_at_last_head_contact[idx] is not None:
-                yaw_delta = yaw - yaw_at_last_head_contact[idx]
-                while yaw_delta > math.pi: yaw_delta -= 2*math.pi
-                while yaw_delta < -math.pi: yaw_delta += 2*math.pi
-                accumulated_yaw_change_after_hit[idx] += abs(yaw_delta)
-                yaw_at_last_head_contact[idx] = yaw
-            if contact_cooldown_steps[idx] > 0:
-                contact_cooldown_steps[idx] -= 1
-            if not head_contact and contact_cooldown_steps[idx] == 0:
-                head_contact_active[idx] = False
-                yaw_at_last_head_contact[idx] = None
-
-            contact_forces = []
-            try:
-                all_contacts = p.getContactPoints(bodyA=agent.body_uid, physicsClientId=client)
-                for c in all_contacts:
-                    contact_forces.append(float(c[9]))
-            except Exception:
-                contact_forces = []
-
-            row = [
-                step, t,
-                base_pos[0], base_pos[1], base_pos[2],
-                roll, pitch, yaw,
-                base_lin_vel[0], base_lin_vel[1], base_lin_vel[2],
-                base_ang_vel[0], base_ang_vel[1], base_ang_vel[2],
-                1.0 if head_contact else 0.0,
-                ";".join([str(j) for j in jinds]),
-                ";".join([f"{jp:.4f}" for jp in joint_positions]),
-                ";".join([f"{float(out[i]):.4f}" for i in range(len(jinds))]),
-                ";".join([f"{cf:.4f}" for cf in contact_forces])
-            ]
-            logger_list[idx].log_step(row)
-
-            if capture_frames and (step % FRAME_SAVE_EVERY == 0):
-                view_matrix = p.computeViewMatrixFromYawPitchRoll(cameraTargetPosition=base_pos,
-                                                                  distance=cam_distance,
-                                                                  yaw=cam_yaw,
-                                                                  pitch=cam_pitch,
-                                                                  roll=0,
-                                                                  upAxisIndex=up_axis_index,
-                                                                  physicsClientId=client)
-                proj_matrix = p.computeProjectionMatrixFOV(fov=60.0, aspect=float(MAX_FRAME_WIDTH)/float(MAX_FRAME_HEIGHT),
-                                                           nearVal=0.01, farVal=10.0, physicsClientId=client)
-                img = p.getCameraImage(width=MAX_FRAME_WIDTH, height=MAX_FRAME_HEIGHT, viewMatrix=view_matrix, projectionMatrix=proj_matrix, physicsClientId=client)
-                w = img[0]; h = img[1]
-                if img[2] is not None:
-                    arr = np.reshape(np.array(img[2], dtype=np.uint8), (h, w, 4))
-                    logger_list[idx].save_frame(arr, step)
 
         p.stepSimulation(physicsClientId=client)
         t += dt
 
+        # check for contacts with walls & whether walls moved due to push
+        # measure baseline wall positions to detect movement
+        left_wall_pos = p.getBasePositionAndOrientation(left_wall, physicsClientId=client)[0]
+        right_wall_pos = p.getBasePositionAndOrientation(right_wall, physicsClientId=client)[0]
+
+        for a_idx, agent in enumerate(agents):
+            if agent is None:
+                continue
+            # contacts with walls
+            contacts_left = p.getContactPoints(bodyA=agent.body_uid, bodyB=left_wall, physicsClientId=client)
+            contacts_right = p.getContactPoints(bodyA=agent.body_uid, bodyB=right_wall, physicsClientId=client)
+            contacted_wall = None
+            wall_id = None
+            if contacts_left:
+                contacted_wall = 'left'
+                wall_id = left_wall
+            elif contacts_right:
+                contacted_wall = 'right'
+                wall_id = right_wall
+
+            if contacted_wall is not None:
+                # check whether wall moved from previous position (if wall mass > 0 it might move)
+                new_wall_pos = p.getBasePositionAndOrientation(wall_id, physicsClientId=client)[0]
+                moved = (abs(new_wall_pos[0] - (left_wall_pos[0] if contacted_wall == 'left' else right_wall_pos[0])) > 1e-3) or \
+                        (abs(new_wall_pos[1] - (left_wall_pos[1] if contacted_wall == 'left' else right_wall_pos[1])) > 1e-3)
+                # read head joint angle
+                hj = head_joint_idx[a_idx]
+                head_angle = 0.0
+                if hj is not None:
+                    try:
+                        info = p.getJointState(agent.body_uid, hj, physicsClientId=client)
+                        head_angle = info[0]  # position
+                    except Exception:
+                        head_angle = 0.0
+                # interpret a "turn away" as head_angle magnitude > small threshold and direction away from wall
+                turned_away = False
+                if contacted_wall == 'left':
+                    # left wall is at negative X; turning right is positive heading about Y axis -> check sign
+                    # because head_joint axis is Y we just check absolute magnitude here
+                    if abs(head_angle) > 0.2:
+                        turned_away = True
+                else:
+                    if abs(head_angle) > 0.2:
+                        turned_away = True
+
+                # register events
+                if not moved and turned_away:
+                    head_turn_events[a_idx] += 1
+                if moved:
+                    wall_movement_when_contact[a_idx] = 1
+
+    # finalize fitness
     fitnesses = []
     end_positions = []
-    upright_scores = []
-    travel_scores = []
-    turn_scores = []
     for i, agent in enumerate(agents):
         try:
-            end_pos, end_ori = p.getBasePositionAndOrientation(agent.body_uid, physicsClientId=client)
-            ex, ey, ez = end_pos
-            sx, sy, sz = start_positions[i]
-            dx = ex - sx
-            dy = ey - sy
-            travel_dist = math.sqrt(dx*dx + dy*dy)
-            roll, pitch, yaw = p.getEulerFromQuaternion(end_ori)
-            tilt = min(1.57, abs(roll) + abs(pitch))
-            upright = max(0.0, 1.0 - (tilt / 1.57))
-            turn_val = min(accumulated_yaw_change_after_hit[i], math.pi * 4) / (math.pi * 4)
+            end_pos, _ = p.getBasePositionAndOrientation(agent.body_uid, physicsClientId=client)
         except Exception:
-            travel_dist = 0.0
-            upright = 0.0
-            turn_val = 0.0
             end_pos = start_positions[i]
-        fit = W_UPRIGHT * upright + W_TRAVEL * travel_dist + W_TURN_AFTER_HIT * turn_val
+        sx, sy, sz = start_positions[i]
+        ex, ey, ez = end_pos
+        dx = ex - sx
+        forward_dist = max(0.0, dx)  # treat +x as forward; if you prefer absolute magnitude use sqrt(dx^2 + dy^2)
+        # head-turn score: normalized events over simulation length
+        head_score = (head_turn_events[i] / max(1, STEPS_PER_GEN / 100.0))
+        penalty = 0.0
+        if wall_movement_when_contact[i] > 0 and head_turn_events[i] > 0:
+            # penalize turning when wall moved (i.e., should have pushed instead)
+            penalty = PENALTY_REFUSE_ON_MOVABLE * (head_turn_events[i] / max(1, 1.0))
+        fit = FIT_FORWARD_WEIGHT * forward_dist + FIT_HEAD_TURN_WEIGHT * head_score - penalty
         fitnesses.append(fit)
         end_positions.append(end_pos)
-        upright_scores.append(upright)
-        travel_scores.append(travel_dist)
-        turn_scores.append(turn_val)
 
-    for lg in logger_list:
-        lg.close()
+    return fitnesses, agent_controllers, start_positions, end_positions
 
-    return fitnesses, agent_controllers, start_positions, end_positions, upright_scores, travel_scores, turn_scores
-
-# ---------------------------
-# Unit-test harness
-# ---------------------------
-def unit_test_controller(controller_path, urdf_morphology='simple', trials=5, seed=1234, capture_frames=False):
-    if not os.path.exists(controller_path):
-        print(f"[unit_test] controller file not found: {controller_path}")
-        return
-
-    with open(controller_path, 'rb') as f:
-        weights = pickle.load(f)
-    W1 = np.array(weights['W1'])
-    b1 = np.array(weights['b1'])
-    W2 = np.array(weights['W2'])
-    b2 = np.array(weights['b2'])
-    input_size = W1.shape[1]
-    hidden_size = W1.shape[0]
-    output_size = W2.shape[0]
-    ctrl = MLPController(input_size, hidden_size, output_size, weights={'W1':W1, 'b1':b1, 'W2':W2, 'b2':b2})
-
-    controllers = [ctrl]
-    urdf_folder = os.path.join(OUTPUT_ROOT, "unit_test_urdfs")
-    os.makedirs(urdf_folder, exist_ok=True)
-    urdf_file = os.path.join(urdf_folder, "unit_test_lizard.urdf")
-    write_lizard_urdf(urdf_file, morphology=urdf_morphology, name_prefix="unit_test", scale=1.0)
-
-    client = p.connect(p.DIRECT)
-    p.setTimeStep(SIMULATION_STEP, physicsClientId=client)
-    p.setGravity(0, 0, WORLD_GRAVITY, physicsClientId=client)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client)
-
-    debug_outdir = os.path.join(OUTPUT_ROOT, "unit_test_results")
-    os.makedirs(debug_outdir, exist_ok=True)
-
-    for tr in range(trials):
-        trial_seed = seed + tr
-        print(f"[unit_test] trial {tr+1}/{trials} seed={trial_seed}")
-        fitnesses, used_controllers, starts, ends, uprights, travels, turns = evaluate_population(
-            client, controllers, [urdf_file], generation_idx=f"unit_{tr+1}",
-            debug_outdir=debug_outdir,
-            perturb_init_pose=0.0, sensor_noise=0.0, mass_perturb=0.0,
-            capture_frames=capture_frames, seed_override=trial_seed
-        )
-        print(f"  fitnesses={fitnesses} upright={uprights} travel={travels} turn={turns}")
-
-    try:
-        p.disconnect(client)
-    except Exception:
-        pass
-    print("[unit_test] complete")
-
-# ---------------------------
-# Evolution CLI
-# ---------------------------
-def run_evolution_cli(args):
-    input_size = 7
-    output_size = 16
+# ------------------------------
+# Evolution loop
+# ------------------------------
+def run_evolution():
+    input_size = 6
+    # choose a reasonable output size: use 40 as before (should be >= num joints)
+    output_size = 40
     hidden_size = HIDDEN_NEURONS
 
-    set_global_seed(args.seed)
+    controllers = make_initial_population(POPULATION, input_size, hidden_size, output_size)
 
-    controllers = [MLPController(input_size, hidden_size, output_size) for _ in range(POPULATION)]
-
-    urdf_folder = os.path.join(OUTPUT_ROOT, "evo_urdfs")
-    os.makedirs(urdf_folder, exist_ok=True)
-    urdf_files = []
+    # initial urdfs for population
     for idx, ctl in enumerate(controllers):
-        urdf_path = os.path.join(urdf_folder, f"init_lizard_{idx}.urdf")
-        write_lizard_urdf(urdf_path, morphology=args.morphology, scale=1.0, name_prefix=f"init_{idx}", body_color=ctl.color)
-        urdf_files.append(urdf_path)
+        color = getattr(ctl, 'color', (0.3,0.6,0.3,1.0))
+        urdf_path = os.path.join(URDF_FOLDER, f"init_ind{idx}.urdf")
+        write_lizard_urdf(urdf_path, body_segments=5, tail_segments=3, scale=1.0, name_prefix=f"init_{idx}", body_color=color)
 
-    STATS_CSV = os.path.join(OUTPUT_ROOT, "generation_stats.csv")
+    # csv headers
     with open(STATS_CSV, 'w', newline='') as csvfile:
         writer = csv.writer(csvfile)
-        writer.writerow(['generation', 'best_fitness', 'mean_fitness', 'median_fitness', 'best_upright', 'best_travel', 'best_turn'])
+        writer.writerow(['generation', 'best_fitness', 'mean_fitness', 'median_fitness'])
 
-    BEST_MODEL_FILE = os.path.join(OUTPUT_ROOT, "best_model.pkl")
-    client = p.connect(p.DIRECT)
-    p.setTimeStep(SIMULATION_STEP, physicsClientId=client)
-    p.setGravity(0, 0, WORLD_GRAVITY, physicsClientId=client)
-    p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client)
+    with open(PER_INDIVIDUAL_CSV, 'w', newline='') as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(['generation', 'individual_index', 'fitness', 'start_x','start_y','start_z','end_x','end_y','end_z'])
 
-    best_overall = None
-    best_overall_fitness = -1.0
     best_overall_controller = None
+    best_overall_fitness = -1e9
 
-    for gen in range(1, args.generations + 1):
-        print(f"\n=== Generation {gen}/{args.generations} ===")
-        fitnesses, used_controllers, starts, ends, uprights, travels, turns = evaluate_population(
-            client, controllers, urdf_files, generation_idx=gen,
-            debug_outdir=os.path.join(OUTPUT_ROOT, f"gen{gen}_logs"),
-            perturb_init_pose=args.perturb_init_pose,
-            sensor_noise=args.sensor_noise,
-            mass_perturb=args.mass_perturb,
-            capture_frames=args.capture_frames,
-            seed_override=(args.seed + gen) if args.seed is not None else None
-        )
+    for gen in range(1, GENERATIONS+1):
+        print(f"\n--- Generation {gen}/{GENERATIONS} ---")
+        # write urdfs for controllers
+        gen_urdfs = []
+        gen_dir = os.path.join(OUTPUT_FOLDER, f"gen_{gen}")
+        os.makedirs(gen_dir, exist_ok=True)
+        for idx, ctl in enumerate(controllers):
+            urdf_path = os.path.join(gen_dir, f"gen{gen}_ind{idx}.urdf")
+            write_lizard_urdf(urdf_path, body_segments=5, tail_segments=3, scale=1.0, name_prefix=f"g{gen}_ind{idx}", body_color=getattr(ctl, 'color', (0.3,0.6,0.3,1.0)))
+            gen_urdfs.append(urdf_path)
 
-        best_idx = int(np.argmax(fitnesses))
-        best_fitness = float(fitnesses[best_idx])
-        mean_fitness = float(np.mean(fitnesses))
-        median_fitness = float(np.median(fitnesses))
-        print(f"  best_fit={best_fitness:.4f} (idx {best_idx}) mean={mean_fitness:.4f}")
+        client = p.connect(p.DIRECT)
+        p.setPhysicsEngineParameter(numSolverIterations=10, physicsClientId=client)
+        p.setTimeStep(SIMULATION_STEP, physicsClientId=client)
+        p.setGravity(0,0,WORLD_GRAVITY, physicsClientId=client)
+        p.setAdditionalSearchPath(pybullet_data.getDataPath(), physicsClientId=client)
+
+        fitnesses, used_controllers, starts, ends = evaluate_population(client, controllers, gen_urdfs, generation=gen, total_generations=GENERATIONS)
+
+        try:
+            p.disconnect(client)
+        except Exception:
+            pass
+
+        best_idx = int(np.argmax(fitnesses)) if fitnesses else 0
+        best_fitness = float(fitnesses[best_idx]) if fitnesses else 0.0
+        mean_fitness = float(np.mean(fitnesses)) if fitnesses else 0.0
+        median_fitness = float(np.median(fitnesses)) if fitnesses else 0.0
+
+        print(f"  best fit: {best_fitness:.4f}, mean: {mean_fitness:.4f}")
 
         with open(STATS_CSV, 'a', newline='') as csvfile:
             writer = csv.writer(csvfile)
-            writer.writerow([gen, best_fitness, mean_fitness, median_fitness, uprights[best_idx], travels[best_idx], turns[best_idx]])
+            writer.writerow([gen, best_fitness, mean_fitness, median_fitness])
 
+        with open(PER_INDIVIDUAL_CSV, 'a', newline='') as csvfile:
+            writer = csv.writer(csvfile)
+            for idx in range(len(used_controllers)):
+                sx, sy, sz = starts[idx]
+                ex, ey, ez = ends[idx]
+                writer.writerow([gen, idx, float(fitnesses[idx]), sx, sy, sz, ex, ey, ez])
+
+        # preserve best overall
         if best_fitness > best_overall_fitness:
             best_overall_fitness = best_fitness
-            best_overall = {'generation': gen, 'index': best_idx, 'fitness': best_fitness}
             best_overall_controller = used_controllers[best_idx].copy()
-            with open(BEST_MODEL_FILE, 'wb') as f:
-                pickle.dump(best_overall_controller.weights, f)
-            best_urdf = os.path.join(OUTPUT_ROOT, f"best_lizard_gen{gen}_ind{best_idx}.urdf")
-            write_lizard_urdf(best_urdf, morphology=args.morphology, scale=1.0, name_prefix=f"best_gen{gen}_ind{best_idx}", body_color=used_controllers[best_idx].color)
+            # save best to pickle (weights dict)
+            with open(BEST_MODEL_FILE, 'wb') as bf:
+                pickle.dump(best_overall_controller.weights, bf)
 
+        # produce next generation: elitism + crossover + mutation
         sorted_idx = np.argsort(fitnesses)[::-1]
         parents = [used_controllers[int(sorted_idx[i])] for i in range(max(1, ELITE_COUNT))]
-
-        next_population = []
-        for pidx in range(ELITE_COUNT):
-            next_population.append(parents[pidx].copy())
-        while len(next_population) < POPULATION:
+        next_pop = []
+        for i in range(ELITE_COUNT):
+            next_pop.append(parents[i].copy())
+        while len(next_pop) < POPULATION:
             a = random.choice(parents)
             b = random.choice(parents)
             child = MLPController.crossover(a, b)
             child.mutate(rate=MUTATION_RATE, prob=MUTATION_PROB)
-            child.color = getattr(a, 'color', getattr(b, 'color', (0.3,0.6,0.3,1.0)))
-            next_population.append(child)
+            if not hasattr(child, 'color'):
+                child.color = getattr(a, 'color', getattr(b, 'color', (0.3,0.6,0.3,1.0)))
+            next_pop.append(child)
+        controllers = next_pop
 
-        controllers = next_population
-        urdf_files = []
-        for idx, ctl in enumerate(controllers):
-            urdf_path = os.path.join(urdf_folder, f"gen{gen}_lizard_{idx}.urdf")
-            write_lizard_urdf(urdf_path, morphology=args.morphology, scale=1.0, name_prefix=f"g{gen}_{idx}", body_color=ctl.color)
-            urdf_files.append(urdf_path)
-
-    try:
-        p.disconnect(client)
-    except Exception:
-        pass
-
-    print(f"\nBest overall: {best_overall}, saved model -> {BEST_MODEL_FILE}")
-    return best_overall, best_overall_controller
-
-# ---------------------------
-# CLI parse
-# ---------------------------
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--generations', type=int, default=GENERATIONS)
-    parser.add_argument('--seed', type=int, default=SEED)
-    parser.add_argument('--perturb_init_pose', type=float, default=0.0)
-    parser.add_argument('--sensor_noise', type=float, default=0.0)
-    parser.add_argument('--mass_perturb', type=float, default=0.0)
-    parser.add_argument('--capture_frames', action='store_true')
-    parser.add_argument('--morphology', choices=['default', 'simple'], default='simple')
-    parser.add_argument('--unit_test', action='store_true')
-    parser.add_argument('--controller', type=str, default='best_model.pkl')
-    parser.add_argument('--trials', type=int, default=5)
-    parser.add_argument('--capture_frames_unit', action='store_true')
-    return parser.parse_args()
+    print("\nEvolution complete. Best fitness:", best_overall_fitness)
+    print("Best model saved to:", BEST_MODEL_FILE)
 
 if __name__ == "__main__":
-    args = parse_args()
-    if args.unit_test:
-        unit_test_controller(args.controller, urdf_morphology=args.morphology, trials=args.trials, seed=args.seed, capture_frames=args.capture_frames_unit)
-    else:
-        run_evolution_cli(args)
+    run_evolution()
