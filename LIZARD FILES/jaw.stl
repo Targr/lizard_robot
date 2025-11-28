@@ -1,0 +1,86 @@
+solid part
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex -0.0945 -0.0375 -0.025
+      vertex 0.0945 -0.0375 -0.025
+      vertex 0.0945 0.0375 -0.025
+    endloop
+  endfacet
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex -0.0945 -0.0375 -0.025
+      vertex 0.0945 0.0375 -0.025
+      vertex -0.0945 0.0375 -0.025
+    endloop
+  endfacet
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex -0.0945 -0.0375 0.025
+      vertex 0.0945 -0.0375 0.025
+      vertex 0.0945 0.0375 0.025
+    endloop
+  endfacet
+  facet normal 0.0 0.0 1.0
+    outer loop
+      vertex -0.0945 -0.0375 0.025
+      vertex 0.0945 0.0375 0.025
+      vertex -0.0945 0.0375 0.025
+    endloop
+  endfacet
+  facet normal 0.0 -1.0 0.0
+    outer loop
+      vertex -0.0945 -0.0375 -0.025
+      vertex 0.0945 -0.0375 -0.025
+      vertex 0.0945 -0.0375 0.025
+    endloop
+  endfacet
+  facet normal 0.0 -1.0 0.0
+    outer loop
+      vertex -0.0945 -0.0375 -0.025
+      vertex 0.0945 -0.0375 0.025
+      vertex -0.0945 -0.0375 0.025
+    endloop
+  endfacet
+  facet normal 0.0 1.0 0.0
+    outer loop
+      vertex 0.0945 0.0375 -0.025
+      vertex -0.0945 0.0375 -0.025
+      vertex -0.0945 0.0375 0.025
+    endloop
+  endfacet
+  facet normal 0.0 1.0 -0.0
+    outer loop
+      vertex 0.0945 0.0375 -0.025
+      vertex -0.0945 0.0375 0.025
+      vertex 0.0945 0.0375 0.025
+    endloop
+  endfacet
+  facet normal 1.0 0.0 0.0
+    outer loop
+      vertex 0.0945 -0.0375 -0.025
+      vertex 0.0945 0.0375 -0.025
+      vertex 0.0945 0.0375 0.025
+    endloop
+  endfacet
+  facet normal 1.0 0.0 0.0
+    outer loop
+      vertex 0.0945 -0.0375 -0.025
+      vertex 0.0945 0.0375 0.025
+      vertex 0.0945 -0.0375 0.025
+    endloop
+  endfacet
+  facet normal 1.0 0.0 0.0
+    outer loop
+      vertex -0.0945 -0.0375 -0.025
+      vertex -0.0945 0.0375 -0.025
+      vertex -0.0945 0.0375 0.025
+    endloop
+  endfacet
+  facet normal 1.0 0.0 0.0
+    outer loop
+      vertex -0.0945 -0.0375 -0.025
+      vertex -0.0945 0.0375 0.025
+      vertex -0.0945 -0.0375 0.025
+    endloop
+  endfacet
+endsolid part
