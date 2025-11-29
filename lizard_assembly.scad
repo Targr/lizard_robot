@@ -1,10 +1,24 @@
 //
-// lizard_assembly.scad
-// Parametric Lizard assembly (units: meters)
-// Paste into OpenSCAD, render, then Export -> Export as STL for any selected object
-//
+// lizard_export_parts.scad
+// All parts placed in separate locations for easy STL export
+// MG90S ONLY configuration
+// Units: meters (scale by 1000 in slicer if needed)
+// ---------------------------------------------------------------------------
 
-// Parameters (from URDF)
+// ------------------------
+// GLOBAL CONFIG
+// ------------------------
+UNIT_SCALE = 1;        // 1 = meters, 1000 = mm
+SERVO_CLEARANCE = 0.0012;  // 1.2mm clearance around MG90S
+RIGID_ONE_PIECE = false;   // false = 5 separate body segments, true = one-piece torso
+
+// MG90S servo footprint (meters)
+SERVO_L = 0.0228;
+SERVO_W = 0.0122;
+SERVO_H = 0.0285;
+SERVO_BODY = [SERVO_L, SERVO_W, SERVO_H];
+
+// lizard URDF geometry
 body_length = 0.35;
 body_width  = 0.12;
 body_height = 0.08;
@@ -17,93 +31,133 @@ head_length = 0.18;
 head_width  = 0.12;
 head_height = 0.06;
 
-leg_length  = 0.22;
-hip_w = 0.04;
-hip_h = 0.04;
-knee_w = 0.03;
-knee_h = 0.03;
+leg_length = 0.22;
+hip_y_offset = 0.12;
+hip_z_offset = 0.02;
 
-eye_radius = 0.02;
+// ------------------------
+// HELPERS
+// ------------------------
+module servo_pocket(orient="y", clearance=SERVO_CLEARANCE, depth=SERVO_H*0.95) {
+    pocket_L = SERVO_L + 2*clearance;
+    pocket_W = SERVO_W + 2*clearance;
+    pocket_H = depth;
 
-// bracket params (approx)
-br_mg90s = [0.025, 0.012, 0.006]; // L, W, H
-br_mg996r = [0.035, 0.015, 0.008];
-
-// convenience: create a box centered at origin but sitting on z=0 (so bottom is on build plate)
-module box_on_plate(sz=[1,1,1]) {
-  translate([ -sz[0]/2, -sz[1]/2, 0]) cube(sz);
+    if (orient=="y")
+        translate([-pocket_W/2, -pocket_L/2, -pocket_H/2])
+            cube([pocket_W, pocket_L, pocket_H]);
 }
 
-// body segment module (centered on its own origin, so we can place multiple)
-module body_segment() {
-  translate([-body_length/2, -body_width/2, 0]) cube([body_length, body_width, body_height]);
+module body_segment_with_pockets() {
+    difference() {
+        // main box
+        translate([-body_length/2, -body_width/2, 0])
+            cube([body_length, body_width, body_height]);
+
+        // left hip pocket
+        translate([0.02, +body_width/2, hip_z_offset])
+            rotate([0,0,90]) servo_pocket("y");
+
+        // right hip pocket
+        translate([0.02, -body_width/2, hip_z_offset])
+            rotate([0,0,-90]) servo_pocket("y");
+    }
 }
 
-// tail segment
-module tail_segment() {
-  translate([-tail_length/2, -tail_width/2, 0]) cube([tail_length, tail_width, tail_height]);
+module head_with_pockets() {
+    difference() {
+        translate([-head_length/2, -head_width/2, 0])
+            cube([head_length, head_width, head_height]);
+
+        // head servo pocket (nod axis)
+        translate([-head_length*0.25, 0, head_height/2])
+            rotate([0,0,90]) servo_pocket("y");
+    }
 }
 
-// head & jaw
-module head() {
-  translate([-head_length/2, -head_width/2, 0]) cube([head_length, head_width, head_height]);
-}
-module jaw() {
-  // jaw positioned relative to head: small offset forward and slightly lower
-  translate([-0.5*head_length + head_length*0.25, -0.075/2, -0.005]) cube([0.189, 0.075, 0.05]);
+module jaw_block() {
+    cube([0.189, 0.075, 0.05]);
 }
 
-// hip and knee (simple boxes for geometry)
-module hip() {
-  translate([-leg_length/2, -hip_w/2, 0]) cube([leg_length, hip_w, hip_h]);
-}
-module knee() {
-  translate([-leg_length/2, -knee_w/2, 0]) cube([leg_length, knee_w, knee_h]);
-}
-
-// eye
-module eye() {
-  translate([0,0,eye_radius]) sphere(r=eye_radius, $fn=32);
+module tail_segment_with_pocket() {
+    difference() {
+        translate([-tail_length/2, -tail_width/2, 0])
+            cube([tail_length, tail_width, tail_height]);
+        translate([tail_length/2 - SERVO_L/2 - 0.005, 0, tail_height/2])
+            rotate([0,0,90]) servo_pocket("y");
+    }
 }
 
-// simple servo bracket: rectangular base (holes not boolean-subtracted for slicer simplicity)
-module servo_bracket(sz=[0.025, 0.012, 0.006]) {
-  translate([-sz[0]/2, -sz[1]/2, 0]) cube(sz);
+module hip_module() {
+    difference() {
+        translate([-leg_length/2, -0.04/2, 0])
+            cube([leg_length, 0.04, 0.04]);
+
+        translate([0, 0.04/2, 0.02])
+            rotate([0,0,90]) servo_pocket("y");
+    }
 }
 
-// ASSEMBLY
-// body_0 ... body_4 placed along +X
-for(i=[0:4]) {
-  translate([ i*(body_length*0.9), 0, 0]) body_segment();
+module knee_module() {
+    difference() {
+        translate([-leg_length/2, -0.03/2, 0])
+            cube([leg_length, 0.03, 0.03]);
+
+        translate([leg_length*0.45, 0, -0.015])
+            rotate([0,0,90]) servo_pocket("y");
+    }
 }
 
-// head on body_0: origin: -body_length*0.55 in x, z offset as in URDF
-translate([ -body_length*0.55, 0, body_height*0.5 + head_height*0.5 - 0.01 ])
-  head();
+module servo_bracket_mg90s() {
+    difference() {
+        translate([-0.025/2, -0.012/2, 0]) cube([0.025,0.012,0.006]);
+        // screw holes (simple through cylinders)
+        translate([-0.006,0,0.003]) rotate([90,0,0]) cylinder(h=0.012, r=0.0018, $fn=20);
+        translate([+0.006,0,0.003]) rotate([90,0,0]) cylinder(h=0.012, r=0.0018, $fn=20);
+    }
+}
 
-// jaw offset
-translate([ -body_length*0.55 + head_length*0.25, 0, body_height*0.5 + head_height*0.5 - 0.01 - head_height*0.5 - 0.005 + 0.05/2 ])
-  jaw();
 
-// tail segments starting after body_4
-tail_start = 4*(body_length*0.9) + tail_length*0.9;
-for(t=[0:2]) translate([ tail_start + t*(tail_length*0.9), 0, 0 ]) tail_segment();
+// =====================================================================
+// EXPORT BLOCK – EACH PART IN ITS OWN TRANSLATE REGION
+// =====================================================================
 
-// legs: using simple placements (front on body_0, rear on body_4)
-translate([ 0.02,  0.12, 0.02 ]) hip();
-translate([ 0.02, -0.12, 0.02 ]) hip();
-translate([ 4*(body_length*0.9)+0.02,  0.12, 0.02 ]) hip();
-translate([ 4*(body_length*0.9)+0.02, -0.12, 0.02 ]) hip();
+// Body segments (or unified torso)
+if (!RIGID_ONE_PIECE) {
+    translate([0,0,0]) body_segment_with_pockets();                     // body_0
+    translate([1,0,0]) body_segment_with_pockets();                     // body_1
+    translate([2,0,0]) body_segment_with_pockets();                     // body_2
+    translate([3,0,0]) body_segment_with_pockets();                     // body_3
+    translate([4,0,0]) body_segment_with_pockets();                     // body_4
+}
+else {
+    // one-piece rigid torso (rarely recommended but supported)
+    translate([0,0,0])
+        cube([5*body_length*0.9, body_width, body_height]);
+}
 
-translate([ 0.02 + leg_length*0.45,  0.12, 0.02 - 0.06 ]) knee();
-translate([ 0.02 + leg_length*0.45, -0.12, 0.02 - 0.06 ]) knee();
-translate([ 4*(body_length*0.9)+0.02 + leg_length*0.45,  0.12, 0.02 - 0.06 ]) knee();
-translate([ 4*(body_length*0.9)+0.02 + leg_length*0.45, -0.12, 0.02 - 0.06 ]) knee();
+// Head
+translate([0,2,0]) head_with_pockets();
 
-// eyes on head
-translate([ -body_length*0.55,  head_width*0.35, body_height*0.5 + head_height*0.5 - 0.01 + eye_radius ]) eye();
-translate([ -body_length*0.55, -head_width*0.35, body_height*0.5 + head_height*0.5 - 0.01 + eye_radius ]) eye();
+// Jaw
+translate([1,2,0]) jaw_block();
 
-// Brackets (place off to the side in the scene for easy exporting)
-translate([ 2.0, 0, 0 ]) servo_bracket(br_mg90s);
-translate([ 2.06, 0, 0 ]) servo_bracket(br_mg996r);
+// Tail segments
+translate([0,4,0]) tail_segment_with_pocket();   // tail_0
+translate([1,4,0]) tail_segment_with_pocket();   // tail_1
+translate([2,4,0]) tail_segment_with_pocket();   // tail_2
+
+// Hip modules
+translate([0,6,0]) hip_module();                 // hip_0
+translate([1,6,0]) hip_module();                 // hip_1
+translate([2,6,0]) hip_module();                 // hip_2
+translate([3,6,0]) hip_module();                 // hip_3
+
+// Knee modules
+translate([0,8,0]) knee_module();                // knee_0
+translate([1,8,0]) knee_module();                // knee_1
+translate([2,8,0]) knee_module();                // knee_2
+translate([3,8,0]) knee_module();                // knee_3
+
+// Brackets
+translate([0,10,0]) servo_bracket_mg90s();
